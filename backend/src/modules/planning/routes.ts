@@ -9,13 +9,14 @@ import { pagination, paginationSchema } from "../../common/pagination.js"
 import { ok, page } from "../../common/response.js"
 import { parseServiceDate } from "../../common/time.js"
 import { expectedVersion } from "../../common/version.js"
-import { LoadRecord, Order, Trip, User, Vehicle } from "../../database/models/index.js"
+import { CalendarDay, LoadRecord, Order, Outlet, Trip, User, Vehicle } from "../../database/models/index.js"
 import { validateTrip } from "./constraints.js"
 
+const objectId = z.string().regex(/^[a-f\d]{24}$/i, "A valid record ID is required.")
 const tripBody = z.object({
-  serviceDate: z.string(), departureAt: z.coerce.date(), plannedEndAt: z.coerce.date(), vehicleId: z.string().min(1), driverId: z.string().min(1),
+  serviceDate: z.string(), departureAt: z.coerce.date(), plannedEndAt: z.coerce.date(), vehicleId: z.string().min(1), driverId: objectId,
   distanceKm: z.number().min(0),
-  stops: z.array(z.object({ orderId: z.string().min(1), plannedArrivalAt: z.coerce.date() })).min(1),
+  stops: z.array(z.object({ orderId: objectId, plannedArrivalAt: z.coerce.date() })).min(1),
 })
 
 async function buildValidation(data: z.infer<typeof tripBody>, excludeTripId?: string) {
@@ -34,11 +35,26 @@ export async function planningRoutes(app: FastifyInstance) {
     const query = z.object({ serviceDate: z.string(), brand: z.string().optional(), status: z.string().optional() }).merge(paginationSchema).safeParse(request.query)
     if (!query.success) throw badRequest("A valid serviceDate and filters are required.")
     parseServiceDate(query.data.serviceDate)
-    const filter: Record<string, unknown> = { requestedDate: query.data.serviceDate, status: query.data.status ?? { $in: ["submitted", "deferred"] }, allocatedTripId: { $exists: false } }
+    const filter: Record<string, unknown> = { allocatedTripId: { $exists: false } }
+    if (query.data.status === "deferred") {
+      filter.status = "deferred"
+      filter.deferredTo = query.data.serviceDate
+    } else if (query.data.status) {
+      filter.status = query.data.status
+      filter.requestedDate = query.data.serviceDate
+    } else {
+      filter.$or = [
+        { status: "submitted", requestedDate: query.data.serviceDate },
+        { status: "deferred", deferredTo: query.data.serviceDate },
+      ]
+    }
     if (query.data.brand) filter.brand = query.data.brand
     const { skip, limit } = pagination(query.data.page, query.data.pageSize)
     const [rows, total] = await Promise.all([Order.find(filter).sort({ cutoffBucket: 1, createdAt: 1 }).skip(skip).limit(limit).lean(), Order.countDocuments(filter)])
-    return page(request, rows, query.data.page, query.data.pageSize, total)
+    const outletIds = [...new Set(rows.map((order) => order.outletId))]
+    const outlets = await Outlet.find({ outletId: { $in: outletIds }, active: true }).select("outletId displayName district depot windowOpenTime windowCloseTime").lean()
+    const outletMap = new Map(outlets.map((outlet) => [outlet.outletId, outlet]))
+    return page(request, rows.map((order) => ({ ...order, outlet: outletMap.get(order.outletId) ?? null })), query.data.page, query.data.pageSize, total)
   })
 
   app.post("/planning/trips", { preHandler: app.authenticate }, async (request, reply) => {
@@ -68,7 +84,7 @@ export async function planningRoutes(app: FastifyInstance) {
 
   app.post("/planning/trips/:tripId/validate", { preHandler: app.authenticate }, async (request) => {
     requireRole(request, "dispatcher")
-    const params = z.object({ tripId: z.string() }).safeParse(request.params)
+    const params = z.object({ tripId: objectId }).safeParse(request.params)
     if (!params.success) throw badRequest("A trip ID is required.")
     const trip = await Trip.findById(params.data.tripId)
     if (!trip) throw notFound()
@@ -81,7 +97,7 @@ export async function planningRoutes(app: FastifyInstance) {
 
   app.post("/planning/trips/:tripId/publish", { preHandler: app.authenticate }, async (request) => {
     const auth = requireRole(request, "dispatcher")
-    const params = z.object({ tripId: z.string() }).safeParse(request.params)
+    const params = z.object({ tripId: objectId }).safeParse(request.params)
     const body = z.object({ expectedVersion: z.number().int().optional() }).safeParse(request.body ?? {})
     if (!params.success || !body.success) throw badRequest("A valid trip ID and version are required.")
     const version = expectedVersion(request, body.data.expectedVersion)
@@ -114,10 +130,12 @@ export async function planningRoutes(app: FastifyInstance) {
 
   app.post("/orders/:orderId/defer", { preHandler: app.authenticate }, async (request) => {
     const auth = requireRole(request, "dispatcher")
-    const params = z.object({ orderId: z.string() }).safeParse(request.params)
+    const params = z.object({ orderId: objectId }).safeParse(request.params)
     const body = z.object({ nextDate: z.string(), reasonCode: z.string().min(1), note: z.string().max(1000).optional() }).safeParse(request.body)
     if (!params.success || !body.success) throw badRequest("A valid deferral request is required.")
     parseServiceDate(body.data.nextDate)
+    const nextDay = await CalendarDay.findOne({ date: body.data.nextDate, isOperating: true }).lean()
+    if (!nextDay) throw unprocessable("NON_OPERATING_DAY", "Orders can only be deferred to an operating day.")
     const order = await Order.findOneAndUpdate({ _id: params.data.orderId, status: { $in: ["submitted", "deferred"] }, allocatedTripId: { $exists: false } }, { $set: { status: "deferred", deferredTo: body.data.nextDate, deferralReason: body.data.reasonCode }, $push: { statusHistory: { status: "deferred", at: new Date(), actorId: auth.userId, note: body.data.note ?? body.data.reasonCode } } }, { new: true })
     if (!order) throw conflict("ORDER_NOT_DEFERRABLE", "The order is no longer available for deferral.")
     await audit(request, "order.deferred", "order", order.id, { nextDate: body.data.nextDate, reasonCode: body.data.reasonCode })
@@ -126,9 +144,11 @@ export async function planningRoutes(app: FastifyInstance) {
 
   app.post("/orders/defer-batch", { preHandler: app.authenticate }, async (request) => {
     const auth = requireRole(request, "dispatcher")
-    const body = z.object({ orderIds: z.array(z.string()).min(1).max(100), nextDate: z.string(), reasonCode: z.string().min(1), note: z.string().max(1000).optional() }).safeParse(request.body)
+    const body = z.object({ orderIds: z.array(objectId).min(1).max(100), nextDate: z.string(), reasonCode: z.string().min(1), note: z.string().max(1000).optional() }).safeParse(request.body)
     if (!body.success) throw badRequest("A valid batch deferral request is required.")
     parseServiceDate(body.data.nextDate)
+    const nextDay = await CalendarDay.findOne({ date: body.data.nextDate, isOperating: true }).lean()
+    if (!nextDay) throw unprocessable("NON_OPERATING_DAY", "Orders can only be deferred to an operating day.")
     const results = []
     for (const orderId of body.data.orderIds) {
       const order = await Order.findOneAndUpdate({ _id: orderId, status: { $in: ["submitted", "deferred"] }, allocatedTripId: { $exists: false } }, { $set: { status: "deferred", deferredTo: body.data.nextDate, deferralReason: body.data.reasonCode }, $push: { statusHistory: { status: "deferred", at: new Date(), actorId: auth.userId, note: body.data.note ?? body.data.reasonCode } } }, { new: true }).lean()
@@ -140,7 +160,7 @@ export async function planningRoutes(app: FastifyInstance) {
 
   app.patch("/planning/trips/:tripId", { preHandler: app.authenticate }, async (request) => {
     requireRole(request, "dispatcher")
-    const params = z.object({ tripId: z.string() }).safeParse(request.params)
+    const params = z.object({ tripId: objectId }).safeParse(request.params)
     const body = tripBody.partial().extend({ expectedVersion: z.number().int().optional() }).safeParse(request.body)
     if (!params.success || !body.success) throw badRequest("The trip edit is invalid.")
     const version = expectedVersion(request, body.data.expectedVersion)
@@ -164,7 +184,7 @@ export async function planningRoutes(app: FastifyInstance) {
 
   app.get("/trips/:tripId", { preHandler: app.authenticate }, async (request) => {
     const auth = requireRole(request, "dispatcher", "loader", "driver")
-    const params = z.object({ tripId: z.string() }).safeParse(request.params)
+    const params = z.object({ tripId: objectId }).safeParse(request.params)
     if (!params.success) throw badRequest("A trip ID is required.")
     const filter: Record<string, unknown> = { _id: params.data.tripId }
     if (auth.role === "driver") filter.driverId = auth.userId

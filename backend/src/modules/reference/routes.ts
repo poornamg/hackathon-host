@@ -1,11 +1,12 @@
 import type { FastifyInstance } from "fastify"
 import { z } from "zod"
 import { requireRole } from "../../common/auth.js"
-import { badRequest, notFound } from "../../common/errors.js"
+import { badRequest, forbidden, notFound } from "../../common/errors.js"
 import { pagination, paginationSchema } from "../../common/pagination.js"
 import { ok, page } from "../../common/response.js"
 import { cutoffContext, parseServiceDate } from "../../common/time.js"
 import { CalendarDay, Outlet, Product, User, Vehicle } from "../../database/models/index.js"
+import { storeManagerContext } from "../orders/context.js"
 
 const clean = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
@@ -48,11 +49,14 @@ export async function referenceRoutes(app: FastifyInstance) {
   })
 
   app.get("/catalog/products", { preHandler: app.authenticate }, async (request) => {
-    requireRole(request, "store_manager")
+    const auth = requireRole(request, "store_manager")
     const query = z.object({ brand: z.string().optional(), orderType: z.string().optional(), search: z.string().max(100).optional() }).merge(paginationSchema).safeParse(request.query)
     if (!query.success) throw badRequest("Invalid catalogue filters.")
-    const filter: Record<string, unknown> = { active: true }
-    if (query.data.brand) filter.brand = query.data.brand
+    const { outlet } = await storeManagerContext(auth.userId)
+    if (query.data.brand && query.data.brand.toLowerCase() !== outlet.brand.toLowerCase()) {
+      throw forbidden("The requested catalogue does not belong to the assigned outlet.")
+    }
+    const filter: Record<string, unknown> = { active: true, brand: outlet.brand }
     if (query.data.orderType) filter.orderTypes = query.data.orderType
     if (query.data.search) filter.$or = [{ sku: { $regex: clean(query.data.search), $options: "i" } }, { name: { $regex: clean(query.data.search), $options: "i" } }]
     const { skip, limit } = pagination(query.data.page, query.data.pageSize)
@@ -68,5 +72,14 @@ export async function referenceRoutes(app: FastifyInstance) {
     const day = await CalendarDay.findOne({ date: parsed.data.date }).lean()
     if (!day) throw notFound("The requested date is outside the imported operating calendar.")
     return ok(request, { ...day, ...cutoffContext(parsed.data.date) })
+  })
+
+  app.get("/calendar/operating-days/next", { preHandler: app.authenticate }, async (request) => {
+    requireRole(request, "dispatcher")
+    const query = z.object({ after: z.string(), limit: z.coerce.number().int().min(1).max(14).default(4) }).safeParse(request.query)
+    if (!query.success) throw badRequest("A valid starting date and limit are required.")
+    parseServiceDate(query.data.after)
+    const days = await CalendarDay.find({ date: { $gt: query.data.after }, isOperating: true }).sort({ date: 1 }).limit(query.data.limit).lean()
+    return ok(request, days)
   })
 }

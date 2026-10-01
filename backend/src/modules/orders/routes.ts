@@ -3,28 +3,32 @@ import type { FastifyInstance } from "fastify"
 import { z } from "zod"
 import { requireRole } from "../../common/auth.js"
 import { audit } from "../../common/audit.js"
-import { badRequest, forbidden, notFound, unprocessable } from "../../common/errors.js"
+import { badRequest, notFound, unprocessable } from "../../common/errors.js"
 import { findIdempotentResult, saveIdempotentResult } from "../../common/idempotency.js"
 import { pagination, paginationSchema } from "../../common/pagination.js"
 import { ok, page } from "../../common/response.js"
 import { cutoffContext, parseServiceDate } from "../../common/time.js"
-import { CalendarDay, Order, Outlet, Product, User } from "../../database/models/index.js"
+import { CalendarDay, Order, Product } from "../../database/models/index.js"
+import { storeManagerContext } from "./context.js"
 
+const objectId = z.string().regex(/^[a-f\d]{24}$/i, "A valid record ID is required.")
 const createBody = z.object({
   orderType: z.string().min(1).max(40),
   requestedDate: z.string(),
-  items: z.array(z.object({ productId: z.string().min(1), quantity: z.number().int().min(1).max(100_000) })).min(1).max(200),
+  items: z.array(z.object({ productId: objectId, quantity: z.number().int().min(1).max(100_000) })).min(1).max(200),
+}).superRefine((value, context) => {
+  if (new Set(value.items.map((item) => item.productId)).size !== value.items.length) {
+    context.addIssue({ code: "custom", path: ["items"], message: "Each product may appear only once." })
+  }
 })
 
-async function managerContext(userId: string) {
-  const user = await User.findById(userId).lean()
-  if (!user?.outletId) throw forbidden("The Store Manager is not assigned to an outlet.")
-  const outlet = await Outlet.findOne({ outletId: user.outletId, active: true }).lean()
-  if (!outlet) throw forbidden("The assigned outlet is unavailable.")
-  return { user, outlet }
-}
-
 export async function orderRoutes(app: FastifyInstance) {
+  app.get("/store/context", { preHandler: app.authenticate }, async (request) => {
+    const auth = requireRole(request, "store_manager")
+    const { outlet } = await storeManagerContext(auth.userId)
+    return ok(request, { outlet })
+  })
+
   app.post("/orders", { preHandler: app.authenticate }, async (request, reply) => {
     const auth = requireRole(request, "store_manager")
     const parsed = createBody.safeParse(request.body)
@@ -34,7 +38,7 @@ export async function orderRoutes(app: FastifyInstance) {
 
     parseServiceDate(parsed.data.requestedDate)
     const [{ outlet }, calendar, products] = await Promise.all([
-      managerContext(auth.userId),
+      storeManagerContext(auth.userId),
       CalendarDay.findOne({ date: parsed.data.requestedDate }).lean(),
       Product.find({ _id: { $in: parsed.data.items.map((item) => item.productId) }, active: true }).lean(),
     ])
@@ -81,7 +85,7 @@ export async function orderRoutes(app: FastifyInstance) {
 
   app.get("/orders", { preHandler: app.authenticate }, async (request) => {
     const auth = requireRole(request, "store_manager")
-    const { outlet } = await managerContext(auth.userId)
+    const { outlet } = await storeManagerContext(auth.userId)
     const query = z.object({ status: z.string().optional(), from: z.string().optional(), to: z.string().optional() }).merge(paginationSchema).safeParse(request.query)
     if (!query.success) throw badRequest("Invalid order filters.")
     const filter: Record<string, unknown> = { outletId: outlet.outletId }
@@ -94,7 +98,7 @@ export async function orderRoutes(app: FastifyInstance) {
 
   app.get("/store/order-history", { preHandler: app.authenticate }, async (request) => {
     const auth = requireRole(request, "store_manager")
-    const { outlet } = await managerContext(auth.userId)
+    const { outlet } = await storeManagerContext(auth.userId)
     const query = paginationSchema.safeParse(request.query)
     if (!query.success) throw badRequest("Invalid history pagination.")
     const { skip, limit } = pagination(query.data.page, query.data.pageSize)
@@ -104,12 +108,12 @@ export async function orderRoutes(app: FastifyInstance) {
 
   app.get("/orders/:orderId", { preHandler: app.authenticate }, async (request) => {
     const auth = requireRole(request, "store_manager", "dispatcher")
-    const params = z.object({ orderId: z.string() }).safeParse(request.params)
+    const params = z.object({ orderId: objectId }).safeParse(request.params)
     if (!params.success) throw badRequest("An order ID is required.")
     const order = await Order.findById(params.data.orderId).lean()
     if (!order) throw notFound()
     if (auth.role === "store_manager") {
-      const { outlet } = await managerContext(auth.userId)
+      const { outlet } = await storeManagerContext(auth.userId)
       if (order.outletId !== outlet.outletId) throw notFound()
     }
     return ok(request, order)

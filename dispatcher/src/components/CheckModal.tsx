@@ -1,6 +1,7 @@
 import { Lock, X } from "lucide-react"
 import type React from "react"
 import type { Order, Vehicle } from "../data/sampleData"
+import type { DriverReference } from "../api/planning"
 import { Button, Heading, IconButton } from "./ui"
 
 type CheckModalProps = {
@@ -15,6 +16,9 @@ type CheckModalProps = {
   lockedIds?: string[]
   /** Route label shown in the title. */
   routeName?: string
+  drivers: DriverReference[]
+  selectedDriverId: string
+  onDriverChange: (driverId: string) => void
 }
 
 export function CheckModal({
@@ -27,6 +31,9 @@ export function CheckModal({
   onSchedule,
   lockedIds = [],
   routeName = "Galle → Matara",
+  drivers,
+  selectedDriverId,
+  onDriverChange,
 }: CheckModalProps) {
   const sorted = [...pack].sort((a, b) => (a.stop ?? 0) - (b.stop ?? 0))
   const kg = pack.reduce((sum, order) => sum + order.kg, 0)
@@ -167,6 +174,13 @@ export function CheckModal({
         </div>
 
         <div className="modal__footer check-footer">
+          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span>Driver</span>
+            <select aria-label="Assigned Driver" value={selectedDriverId} onChange={(event) => onDriverChange(event.target.value)}>
+              <option value="">Select an active Driver</option>
+              {drivers.map((driver) => <option key={driver._id} value={driver._id}>{driver.name} · {driver.employeeId}</option>)}
+            </select>
+          </label>
           <span>
             {checked.length} of {pack.length} checked.{" "}
             <em>
@@ -179,7 +193,7 @@ export function CheckModal({
             Back to edit
           </Button>
           <Button
-            disabled={!allChecked}
+            disabled={!allChecked || !selectedDriverId}
             onClick={onSchedule}
             variant="confirm"
           >

@@ -26,7 +26,7 @@ import {
 } from "lucide-react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import wayTrackLogo from "./assets/waytrack-logo.png"
-import { planningApi, type DriverReference, type TripInput } from "./api/planning"
+import { planningApi, type DriverReference, type OperatingDay, type TripInput } from "./api/planning"
 import { apiRequest } from "./api/client"
 import { clearSession } from "./auth/session"
 import { CalendarModal } from "./components/CalendarModal"
@@ -918,45 +918,34 @@ function OrderRow({
   )
 }
 
-function ReachMap({ packed }: { packed: boolean }) {
+function ReachMap({ packed, orders }: { packed: boolean; orders: Order[] }) {
+  const visibleOrders = packed ? orders.filter((order) => order.stop || order.inReach) : orders.filter((order) => order.inReach)
   return (
     <div className="map-wrap">
       <div
         className="reach-map"
-        aria-label="Vehicle reach map from Galle to Matara"
+        aria-label="Vehicle reach overview"
       >
-        <span className="map-label map-label--akuressa">
-          Akuressa · out of reach
-        </span>
-        <span className="out-pin" />
-        <span className="map-label map-label--depot">Galle depot</span>
+        <span className="map-label map-label--depot">Dispatch depot</span>
         <span className="depot-pin" />
         <div className="reach-zone" />
         {packed ? <div className="route-line" /> : null}
-        {[8, 25, 56, 70, 91].map((left) => (
+        {visibleOrders.map((order, index) => (
           <span
             className={`shop-pin ${packed ? "shop-pin--covered" : ""}`}
-            key={left}
-            style={{ left: `${left}%` }}
+            key={order.id}
+            style={{ left: `${8 + (index * 83) / Math.max(1, visibleOrders.length - 1)}%` }}
           />
         ))}
-        <span className="map-label map-label--weligama">Weligama</span>
-        <span className="map-label map-label--matara">Matara</span>
       </div>
       <div className="shop-reach">
-        <strong>{packed ? "Shops covered" : "Shops in reach"} · 5</strong>
-        {[
-          "Sunrise Mart",
-          "Lanka Super Stores",
-          "Coastal Traders",
-          "Mirissa Mart",
-          "Matara City Mart",
-        ].map((shop) => (
-          <span key={shop}>
-            {packed ? <Check aria-hidden="true" size={17} /> : <i />} {shop}
+        <strong>{packed ? "Shops covered" : "Shops in reach"} · {visibleOrders.length}</strong>
+        {visibleOrders.map((order) => (
+          <span key={order.id}>
+            {packed ? <Check aria-hidden="true" size={17} /> : <i />} {order.shop}
           </span>
         ))}
-        <p>Hill View Stores, Akuressa, is out of reach</p>
+        {!visibleOrders.length ? <p>No eligible shops for the selected vehicle.</p> : null}
       </div>
     </div>
   )
@@ -970,21 +959,25 @@ function SchedulePage({
   setOrders,
   onOpenManageVehicles,
   onOpenDefer,
+  drivers,
+  serviceDate,
+  operatingDays,
 }: {
-  navigateHome: (message: string, scheduled: Order[], vehicle: Vehicle, routeDate: string, departureTime: string) => void | Promise<void>
+  navigateHome: (message: string, scheduled: Order[], vehicle: Vehicle, routeDate: string, departureTime: string, driverId: string) => void | Promise<void>
   vehicles: Vehicle[]
   setVehicles: React.Dispatch<React.SetStateAction<Vehicle[]>>
   orders: Order[]
   setOrders: React.Dispatch<React.SetStateAction<Order[]>>
   onOpenManageVehicles: () => void
   onOpenDefer: () => void
+  drivers: DriverReference[]
+  serviceDate: string
+  operatingDays: OperatingDay[]
 }) {
   const params = new URLSearchParams(window.location.search)
   const dateParam = params.get("date")
   const isDatePreset = Boolean(dateParam)
-  const [routeDate, setRouteDate] = useState(() =>
-    isDatePreset ? "Mon 28 Sep" : "Today · Sun 27",
-  )
+  const [routeDate, setRouteDate] = useState(() => dateParam ?? serviceDate)
   const [departsTime, setDepartsTime] = useState(() =>
     isDatePreset ? "07:00" : "12:30",
   )
@@ -997,6 +990,12 @@ function SchedulePage({
   const [overlay, setOverlay] = useState<"review" | "check" | null>(null)
   const [reviewPack, setReviewPack] = useState<Order[]>([])
   const [checked, setChecked] = useState<string[]>([])
+  const [selectedDriverId, setSelectedDriverId] = useState("")
+  const routeDateOptions = useMemo(
+    () => Array.from(new Set([serviceDate, ...operatingDays.map((day) => day.date)])).slice(0, 5),
+    [serviceDate, operatingDays],
+  )
+  const formatRouteDate = (date: string) => new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(`${date}T00:00:00Z`))
 
   const highlightedOrder = params.get("order")
 
@@ -1088,37 +1087,19 @@ function SchedulePage({
             >
               <Clock size={16} />
               <span>
-                Route date: {routeDate} · departs {departsTime} ▾
+                Route date: {formatRouteDate(routeDate)} · departs {departsTime} ▾
               </span>
             </button>
             {dateChipOpen && (
               <div className="route-date-popover">
                 <strong>Route date</strong>
                 <div className="route-date-options">
-                  <button
-                    className={`route-date-option ${routeDate.includes("27") ? "route-date-option--active" : ""}`}
-                    onClick={() => {
-                      setRouteDate("Today · Sun 27")
-                      setDepartsTime("12:30")
-                      setDateChipOpen(false)
-                    }}
-                    type="button"
-                  >
-                    <span>Today · Sun 27 Sep</span>
-                    <small>Live</small>
-                  </button>
-                  <button
-                    className={`route-date-option ${routeDate.includes("28") ? "route-date-option--active" : ""}`}
-                    onClick={() => {
-                      setRouteDate("Mon 28 Sep")
-                      setDepartsTime("07:00")
-                      setDateChipOpen(false)
-                    }}
-                    type="button"
-                  >
-                    <span>Mon 28 Sep</span>
-                    <small>Planning</small>
-                  </button>
+                  {routeDateOptions.map((date, index) => (
+                    <button className={`route-date-option ${routeDate === date ? "route-date-option--active" : ""}`} onClick={() => { setRouteDate(date); setDateChipOpen(false) }} type="button" key={date}>
+                      <span>{formatRouteDate(date)}</span>
+                      <small>{index === 0 ? "Current service day" : "Planning"}</small>
+                    </button>
+                  ))}
                 </div>
                 <strong>Departure slot</strong>
                 <div className="route-time-slots">
@@ -1150,7 +1131,7 @@ function SchedulePage({
             <div>
               <Heading>Orders</Heading>
               <span>
-                {openOrders.length} open · <b style={{ color: "var(--critical-500)" }}>2 emergency</b>
+                {openOrders.length} open · <b style={{ color: "var(--critical-500)" }}>{openOrders.filter((order) => order.emergency).length} emergency</b>
               </span>
             </div>
           </div>
@@ -1183,18 +1164,18 @@ function SchedulePage({
                   Undo
                 </Button>
               </div>
-            ) : (
+            ) : suggestedOrders.length > 0 ? (
               <div className="suggestion-banner suggestion-banner--ai">
                 <Bolt size={24} color="var(--cobalt-500)" />
                 <div>
-                  <strong>AI suggested: 5 orders</strong>
-                  <span>1,260 kg, fits reach</span>
+                  <strong>AI suggested: {suggestedOrders.length} orders</strong>
+                  <span>{suggestedOrders.reduce((sum, order) => sum + order.kg, 0).toLocaleString()} kg, fits reach</span>
                 </div>
                 <Button onClick={openReview} variant="primary">
                   Review
                 </Button>
               </div>
-            )
+            ) : null
           ) : null}
 
           {/* Orders List */}
@@ -1280,7 +1261,7 @@ function SchedulePage({
                 </div>
               </div>
 
-              <ReachMap packed={packed} />
+              <ReachMap packed={packed} orders={packed ? addedOrders : openOrders} />
 
               <div className="selected-footer">
                 <strong>
@@ -1407,6 +1388,9 @@ function SchedulePage({
       {overlay === "check" && vehicle ? (
         <CheckModal
           checked={checked}
+          drivers={drivers}
+          selectedDriverId={selectedDriverId}
+          onDriverChange={setSelectedDriverId}
           onClose={() => setOverlay(null)}
           onDrop={(id) => {
             setAdded((prev) => prev.filter((item) => item !== id))
@@ -1415,7 +1399,7 @@ function SchedulePage({
           onSchedule={() => {
             setOverlay(null)
             recordTurn(vehicle)
-            void navigateHome(`Route ${vehicle.id} scheduled`, addedOrders, vehicle, routeDate, departsTime)
+            void navigateHome(`Route ${vehicle.id} scheduled`, addedOrders, vehicle, routeDate, departsTime, selectedDriverId)
           }}
           pack={addedOrders}
           setChecked={setChecked}
@@ -1599,6 +1583,7 @@ function DueSchedulePage({
   onOpenDefer,
   onOpenNormal,
   onScheduled,
+  drivers,
 }: {
   day: number
   vehicles: Vehicle[]
@@ -1606,7 +1591,8 @@ function DueSchedulePage({
   onOpenManageVehicles: () => void
   onOpenDefer: () => void
   onOpenNormal: () => void
-  onScheduled: (message: string, scheduled: Order[], day: number, vehicle: Vehicle, departureTime: string) => void | Promise<void>
+  onScheduled: (message: string, scheduled: Order[], day: number, vehicle: Vehicle, departureTime: string, driverId: string) => void | Promise<void>
+  drivers: DriverReference[]
 }) {
   const isToday = day === TODAY
   const label = dayLabel(day)
@@ -1664,6 +1650,7 @@ function DueSchedulePage({
   const [added, setAdded] = useState<string[]>([])
   const [overlay, setOverlay] = useState<"review" | "check" | null>(null)
   const [reviewPack, setReviewPack] = useState<Order[]>([])
+  const [selectedDriverId, setSelectedDriverId] = useState("")
   const [checked, setChecked] = useState<string[]>([])
 
   const aiVehicle = candidates.length ? candidates[suggestIndex % candidates.length] : null
@@ -2067,6 +2054,9 @@ function DueSchedulePage({
       {overlay === "check" && vehicle ? (
         <CheckModal
           checked={checked}
+          drivers={drivers}
+          selectedDriverId={selectedDriverId}
+          onDriverChange={setSelectedDriverId}
           lockedIds={locked.map((o) => o.id)}
           onClose={() => setOverlay(null)}
           onDrop={(id) => {
@@ -2084,6 +2074,7 @@ function DueSchedulePage({
               day,
               vehicle,
               departs,
+              selectedDriverId,
             )
           }}
           pack={pack}
@@ -2402,6 +2393,7 @@ function MonitorPage({
 }
 
 export default function App() {
+  const prototypeMode = import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE === "true"
   const [path, setPath] = useState(getInitialPath)
   const [search, setSearch] = useState(() => window.location.search)
   const [toast, setToast] = useState("")
@@ -2421,28 +2413,32 @@ export default function App() {
     new URLSearchParams(window.location.search).get("date") ? 28 : 27,
   )
 
-  const [vehicles, setVehicles] = useState<Vehicle[]>(initialVehicles)
+  const [vehicles, setVehicles] = useState<Vehicle[]>(prototypeMode ? initialVehicles : [])
   const [drivers, setDrivers] = useState<DriverReference[]>([])
-  const [orders, setOrders] = useState<Order[]>(initialOrders)
-  const [routes, setRoutes] = useState<RouteRecord[]>(initialRoutes)
-  const [remarks, setRemarks] = useState<Remark[]>(initialRemarks)
+  const [deferDates, setDeferDates] = useState<OperatingDay[]>([])
+  const [orders, setOrders] = useState<Order[]>(prototypeMode ? initialOrders : [])
+  const [routes, setRoutes] = useState<RouteRecord[]>(prototypeMode ? initialRoutes : [])
+  const [remarks, setRemarks] = useState<Remark[]>(prototypeMode ? initialRemarks : [])
+  const [planningLoading, setPlanningLoading] = useState(!prototypeMode)
+  const [planningError, setPlanningError] = useState("")
 
   useEffect(() => {
     if (import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE === "true") return
     const serviceDate = import.meta.env.VITE_SERVICE_DATE ?? new Date().toISOString().slice(0, 10)
-    void Promise.all([planningApi.orders(serviceDate), planningApi.vehicles(serviceDate), planningApi.drivers()])
-      .then(([apiOrders, apiVehicles, apiDrivers]) => {
+    setPlanningLoading(true)
+    void Promise.all([planningApi.orders(serviceDate), planningApi.vehicles(serviceDate), planningApi.drivers(), planningApi.operatingDays(serviceDate)])
+      .then(([apiOrders, apiVehicles, apiDrivers, apiOperatingDays]) => {
         setOrders(apiOrders.map((order) => ({
           apiId: order._id,
           id: order.orderNumber,
-          shop: order.outletId,
-          town: order.outletId,
+          shop: order.outlet?.displayName ?? order.outletId,
+          town: order.outlet?.district ?? order.outlet?.depot ?? order.outletId,
           type: order.brand,
           items: `${order.items.reduce((sum, item) => sum + item.quantity, 0)} units`,
           kg: order.totalWeightKg,
           emergency: order.cutoffBucket === "after_cutoff",
-          inReach: true,
-          suggested: true,
+          inReach: Boolean(order.outlet),
+          suggested: false,
         })))
         setVehicles(apiVehicles.map((vehicle) => ({
           id: vehicle.vehicleId,
@@ -2456,12 +2452,18 @@ export default function App() {
           fuel: 100,
         })))
         setDrivers(apiDrivers)
+        setDeferDates(apiOperatingDays)
+        setPlanningError("")
       })
       .catch((error) => {
         console.error("Dispatcher planning data request failed", error)
         setOrders([])
         setVehicles([])
+        setDrivers([])
+        setDeferDates([])
+        setPlanningError(error instanceof Error ? error.message : "Unable to load planning data.")
       })
+      .finally(() => setPlanningLoading(false))
   }, [])
 
   const [manageVehiclesOpen, setManageVehiclesOpen] = useState(false)
@@ -2489,20 +2491,18 @@ export default function App() {
   }
 
   const serviceDate = import.meta.env.VITE_SERVICE_DATE ?? new Date().toISOString().slice(0, 10)
-  const prototypeMode = import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE === "true"
-
   const datePlusDays = (date: string, days: number) => {
     const value = new Date(`${date}T00:00:00Z`)
     value.setUTCDate(value.getUTCDate() + days)
     return value.toISOString().slice(0, 10)
   }
 
-  const publishSchedule = async (scheduled: Order[], vehicle: Vehicle, targetDate: string, departureTime: string) => {
+  const publishSchedule = async (scheduled: Order[], vehicle: Vehicle, targetDate: string, departureTime: string, driverId: string) => {
     if (prototypeMode) return
     const liveOrders = scheduled.filter((order): order is Order & { apiId: string } => Boolean(order.apiId))
     if (liveOrders.length !== scheduled.length) throw new Error("One or more selected orders are not backed by the planning service.")
-    const driver = drivers[0]
-    if (!driver) throw new Error("No active Driver is available for this route.")
+    const driver = drivers.find((candidate) => candidate._id === driverId)
+    if (!driver) throw new Error("Select an active Driver for this route.")
     const departureAt = new Date(`${targetDate}T${departureTime}:00+05:30`)
     const input: TripInput = {
       serviceDate: targetDate,
@@ -2542,20 +2542,19 @@ export default function App() {
     })
   }
 
-  const completeSchedule = async (message: string, scheduled: Order[], vehicle: Vehicle, routeDate: string, departureTime: string) => {
+  const completeSchedule = async (message: string, scheduled: Order[], vehicle: Vehicle, routeDate: string, departureTime: string, driverId: string) => {
     try {
-      const targetDate = routeDate.includes("28") ? datePlusDays(serviceDate, 1) : serviceDate
-      await publishSchedule(scheduled, vehicle, targetDate, departureTime)
+      await publishSchedule(scheduled, vehicle, routeDate, departureTime, driverId)
       finishSchedule(message, scheduled)
     } catch (error) {
       setToast(error instanceof Error ? error.message : "The route could not be published.")
     }
   }
 
-  const completeImmediate = async (message: string, scheduled: Order[], day: number, vehicle: Vehicle, departureTime: string) => {
+  const completeImmediate = async (message: string, scheduled: Order[], day: number, vehicle: Vehicle, departureTime: string, driverId: string) => {
     try {
       const targetDate = datePlusDays(serviceDate, Math.max(0, day - TODAY))
-      await publishSchedule(scheduled, vehicle, targetDate, departureTime)
+      await publishSchedule(scheduled, vehicle, targetDate, departureTime, driverId)
       finishSchedule(message, scheduled, day)
     } catch (error) {
       setToast(error instanceof Error ? error.message : "The route could not be published.")
@@ -2580,9 +2579,8 @@ export default function App() {
       if (!prototypeMode) {
         const apiIds = selected.map((order) => order.apiId).filter((id): id is string => Boolean(id))
         if (apiIds.length !== selected.length) throw new Error("One or more selected orders are not backed by the planning service.")
-        const offset = deferTo.startsWith("Wed") ? 3 : deferTo.startsWith("Tue") ? 2 : 1
         const reasonCode = (reasons[0] ?? "dispatcher_deferral").toLowerCase().replaceAll(/[^a-z0-9]+/g, "_").replaceAll(/^_|_$/g, "")
-        const results = await planningApi.deferBatch(apiIds, datePlusDays(serviceDate, offset), reasonCode, [reasons.join(", "), notice].filter(Boolean).join(" — "))
+        const results = await planningApi.deferBatch(apiIds, deferTo, reasonCode, [reasons.join(", "), notice].filter(Boolean).join(" — "))
         const conflicts = results.filter((result) => result.result === "conflict").length
         if (conflicts) throw new Error(`${conflicts} order${conflicts === 1 ? "" : "s"} changed before deferral. Refresh and try again.`)
       }
@@ -2604,7 +2602,7 @@ export default function App() {
       ),
     )
     setDeferOpen(false)
-    setToast(`${selectedIds.length} orders deferred to ${deferTo.split(" · ")[0]}`)
+    setToast(`${selectedIds.length} orders deferred to ${new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(`${deferTo}T00:00:00Z`))}`)
   }
 
   const handleUpdateVehicles = (updated: Vehicle[]) => {
@@ -2613,13 +2611,21 @@ export default function App() {
     setToast("Weekly quota updated")
   }
 
+  if (!prototypeMode && planningLoading) {
+    return <AppShell navigate={navigate} path={path}><section className="page"><PageTitle>Loading planning data…</PageTitle></section></AppShell>
+  }
+  if (!prototypeMode && planningError) {
+    return <AppShell navigate={navigate} path={path}><section className="page"><PageTitle>Planning data unavailable</PageTitle><p>{planningError}</p></section></AppShell>
+  }
+
   return (
     <AppShell navigate={navigate} path={path}>
-      {path === "/schedule" &&
+      {prototypeMode && path === "/schedule" &&
         ["immediate", "due"].includes(
           new URLSearchParams(search).get("mode") ?? "",
         ) ? (
         <DueSchedulePage
+          drivers={drivers}
           day={
             new URLSearchParams(search).get("mode") === "immediate"
               ? 27
@@ -2637,6 +2643,9 @@ export default function App() {
         />
       ) : path === "/schedule" ? (
         <SchedulePage
+          drivers={drivers}
+          serviceDate={serviceDate}
+          operatingDays={deferDates}
           key={search}
           navigateHome={completeSchedule}
           onOpenDefer={() => setDeferOpen(true)}
@@ -2692,6 +2701,7 @@ export default function App() {
       {/* Global Modals for Defer & Manage Vehicles */}
       {deferOpen ? (
         <DeferModal
+          deferDates={deferDates}
           onClose={() => setDeferOpen(false)}
           onDefer={handleDeferOrders}
           orders={orders.filter((o) => !o.deferred)}

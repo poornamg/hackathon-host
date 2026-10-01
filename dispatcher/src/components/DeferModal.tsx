@@ -5,6 +5,7 @@ import { Button, Heading, IconButton, ShopTag } from "./ui"
 
 type DeferModalProps = {
   orders: Order[]
+  deferDates: Array<{ date: string; dayOfWeek: string }>
   onClose: () => void
   onDefer: (selectedIds: string[], deferTo: string, reasons: string[], notice: string) => void
 }
@@ -16,28 +17,12 @@ const REASON_OPTIONS = [
   "No vehicle",
 ]
 
-const DEFER_DATES = [
-  "Mon 28 Sep · morning",
-  "Mon 28 Sep · afternoon",
-  "Tue 29 Sep · morning",
-  "Wed 30 Sep · morning",
-]
-
-export function DeferModal({ orders, onClose, onDefer }: DeferModalProps) {
-  // Preselect 2 orders like in screenshot 03c
-  const [selectedIds, setSelectedIds] = useState<string[]>(() => {
-    const defaultIds = ["ORD-1047", "ORD-1056"]
-    const available = orders.map((o) => o.id)
-    const matching = defaultIds.filter((id) => available.includes(id))
-    return matching.length ? matching : available.slice(0, 2)
-  })
-
-  const [deferDate, setDeferDate] = useState(DEFER_DATES[0])
+export function DeferModal({ orders, deferDates, onClose, onDefer }: DeferModalProps) {
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [deferDate, setDeferDate] = useState(deferDates[0]?.date ?? "")
   const [dateDropdownOpen, setDateDropdownOpen] = useState(false)
-  const [reasons, setReasons] = useState<string[]>(["Shop closed"])
-  const [notice, setNotice] = useState(
-    "Both shops closed today for a local holiday. Deliver first thing Monday.",
-  )
+  const [reasons, setReasons] = useState<string[]>([])
+  const [notice, setNotice] = useState("")
   const [sendNotice, setSendNotice] = useState(true)
 
   const toggleSelect = (id: string) => {
@@ -55,8 +40,8 @@ export function DeferModal({ orders, onClose, onDefer }: DeferModalProps) {
   }
 
   const handleDefer = () => {
-    if (!selectedIds.length) return
-    onDefer(selectedIds, deferDate, reasons, notice)
+    if (!selectedIds.length || !deferDate || !reasons.length) return
+    onDefer(selectedIds, deferDate, reasons, sendNotice ? notice : "")
   }
 
   return (
@@ -126,7 +111,7 @@ export function DeferModal({ orders, onClose, onDefer }: DeferModalProps) {
               >
                 <span style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
                   <Clock size={16} color="var(--navy-900)" />
-                  {deferDate}
+                  {deferDate ? new Intl.DateTimeFormat(undefined, { dateStyle: "full", timeZone: "UTC" }).format(new Date(`${deferDate}T00:00:00Z`)) : "No operating day available"}
                 </span>
                 <ChevronDown size={16} />
               </button>
@@ -146,11 +131,11 @@ export function DeferModal({ orders, onClose, onDefer }: DeferModalProps) {
                     padding: "6px",
                   }}
                 >
-                  {DEFER_DATES.map((date) => (
+                  {deferDates.map((day) => (
                     <button
-                      key={date}
+                      key={day.date}
                       onClick={() => {
-                        setDeferDate(date)
+                        setDeferDate(day.date)
                         setDateDropdownOpen(false)
                       }}
                       style={{
@@ -160,15 +145,15 @@ export function DeferModal({ orders, onClose, onDefer }: DeferModalProps) {
                         textAlign: "left",
                         border: 0,
                         borderRadius: "6px",
-                        background: deferDate === date ? "var(--cobalt-50)" : "transparent",
-                        color: deferDate === date ? "var(--cobalt-500)" : "var(--navy-900)",
+                        background: deferDate === day.date ? "var(--cobalt-50)" : "transparent",
+                        color: deferDate === day.date ? "var(--cobalt-500)" : "var(--navy-900)",
                         fontWeight: 600,
                         fontSize: "13px",
                         cursor: "pointer",
                       }}
                       type="button"
                     >
-                      {date}
+                      {new Intl.DateTimeFormat(undefined, { dateStyle: "full", timeZone: "UTC" }).format(new Date(`${day.date}T00:00:00Z`))}
                     </button>
                   ))}
                 </div>
@@ -220,7 +205,7 @@ export function DeferModal({ orders, onClose, onDefer }: DeferModalProps) {
           <div className="defer-footer-actions">
             <Button onClick={onClose}>Cancel</Button>
             <Button
-              disabled={selectedIds.length === 0}
+              disabled={selectedIds.length === 0 || !deferDate || reasons.length === 0}
               onClick={handleDefer}
               variant="primary"
             >

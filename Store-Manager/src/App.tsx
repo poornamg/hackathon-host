@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, type ReactNode } from "react"
-import { getCatalogue, submitStoreOrder, storeDeliveryApi, type StoreDelivery } from "./api/store"
+import { getCatalogue, getStoreContext, getStoreOrder, listStoreOrders, submitStoreOrder, storeDeliveryApi, type CreatedOrder, type StoreContext, type StoreDelivery, type StoreOrder } from "./api/store"
 import { AnimatePresence, motion, useMotionValue, animate, useTransform } from "motion/react"
 import wayTrackLogo from "./assets/waytrack-logo.png"
 import {
@@ -102,7 +102,7 @@ function IconButton({
   )
 }
 
-type StatusKind = "confirmed" | "scheduled" | "transit" | "arrived" | "deferred" | "awaiting" | "received" | "issue"
+type StatusKind = "confirmed" | "scheduled" | "transit" | "arrived" | "deferred" | "awaiting" | "received" | "issue" | "cancelled"
 
 const statusDetails: Record<StatusKind, {
   label: string
@@ -116,6 +116,7 @@ const statusDetails: Record<StatusKind, {
   awaiting: { label: "Awaiting confirmation", icon: <CircleAlert /> },
   received: { label: "Receipt confirmed", icon: <PackageCheck /> },
   issue: { label: "Receipt confirmed with issue", icon: <AlertTriangle /> },
+  cancelled: { label: "Cancelled", icon: <CircleAlert /> },
 }
 
 function formatOutlet(business: "fresh" | "style" | "tech" = "fresh") {
@@ -2318,26 +2319,36 @@ function NewOrderPage({ business,
   const [searchQuery, setSearchQuery] = useState(initialSearch)
   const [summaryOpen, setSummaryOpen] = useState(initialSummaryOpen)
   const [, setCatalogueVersion] = useState(0)
+  const prototypeMode = import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE === "true"
+  const [catalogueState, setCatalogueState] = useState<"loading" | "loaded" | "error">(prototypeMode ? "loaded" : "loading")
+  const [catalogueError, setCatalogueError] = useState("")
 
   useEffect(() => {
     let active = true
+    if (!prototypeMode) {
+      setCatalogueState("loading")
+      setCatalogueError("")
+    }
     void getCatalogue(business, type)
       .then((rows) => {
         if (!active) return
         productCatalog[business][type] = rows.map((row) => ({ id: row._id, name: row.name, unit: row.unit }))
+        setCatalogueState("loaded")
         setCatalogueVersion((version) => version + 1)
       })
       .catch((error) => {
-        if (import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE !== "true") {
+        if (!prototypeMode) {
           productCatalog[business][type] = []
+          setCatalogueState("error")
+          setCatalogueError(error instanceof Error ? error.message : "Unable to load the product catalogue.")
           setCatalogueVersion((version) => version + 1)
         }
         console.error("Catalogue request failed", error)
       })
     return () => { active = false }
-  }, [business, type])
+  }, [business, prototypeMode, type])
 
-  const products = getCatalog(business, type)
+  const products = prototypeMode || catalogueState === "loaded" ? getCatalog(business, type) : []
   const filteredProducts = products.filter((product) =>
     product.name.toLowerCase().includes(searchQuery.trim().toLowerCase()),
   )
@@ -2420,7 +2431,19 @@ function NewOrderPage({ business,
               exit={{ opacity: 0, x: -8 }}
               transition={{ duration: 0.18, ease: "easeOut" }}
             >
-              {filteredProducts.length > 0 ? (
+              {catalogueState === "loading" && !prototypeMode ? (
+                <div className="product-search-empty">
+                  <LoaderCircle className="loading-icon" />
+                  <strong>Loading products…</strong>
+                  <p>Fetching the catalogue for your assigned outlet.</p>
+                </div>
+              ) : catalogueState === "error" && !prototypeMode ? (
+                <div className="product-search-empty">
+                  <AlertTriangle />
+                  <strong>Products could not be loaded</strong>
+                  <p>{catalogueError}</p>
+                </div>
+              ) : filteredProducts.length > 0 ? (
                 filteredProducts.map((product) => (
                   <ProductSelectionRow
                     product={product}
@@ -2494,18 +2517,19 @@ function NewOrderPage({ business,
   )
 }
 
-function ReviewContext({ business, 
+function ReviewContext({ business,
   type,
   afterCutoff,
+  outletName,
 
-}: { business: "fresh" | "style" | "tech", type: OrderType, afterCutoff: boolean
+}: { business: "fresh" | "style" | "tech", type: OrderType, afterCutoff: boolean, outletName: string
 
 }) {
   return (
     <div className="review-context">
       <div>
         <span>Store</span>
-        <strong>{formatOutlet(business)}</strong>
+        <strong>{outletName}</strong>
       </div>
       <div>
         <strong>{formatOrderType(business || "fresh", getDefaultOrderType(business || "fresh"))}</strong>
@@ -2608,13 +2632,15 @@ function ReviewOrderPage({ business,
   forceError,
   onBack,
   onConfirmed,
+  outletName,
 }: { business: "fresh" | "style" | "tech"
   type: OrderType
   quantities: OrderDrafts
   afterCutoff: boolean
   forceError: boolean
   onBack: () => void
-  onConfirmed: () => void
+  onConfirmed: (order: CreatedOrder) => void
+  outletName: string
 }) {
   const [submissionState, setSubmissionState] =
     useState<SubmissionState>("idle")
@@ -2625,8 +2651,8 @@ function ReviewOrderPage({ business,
     setSubmissionState("submitting")
     if (forceError) { setSubmissionState("error"); return }
     try {
-      await submitStoreOrder({ business, type, items: items.map((item) => ({ id: item.id, quantity: item.quantity })) })
-      onConfirmed()
+      const order = await submitStoreOrder({ business, type, items: items.map((item) => ({ id: item.id, quantity: item.quantity })) })
+      onConfirmed(order)
     } catch (error) {
       console.error("Order submission failed", error)
       setSubmissionState("error")
@@ -2643,7 +2669,7 @@ function ReviewOrderPage({ business,
         </div>
       </div>
 
-      <ReviewContext business={business} type={type} afterCutoff={afterCutoff} />
+      <ReviewContext business={business} type={type} afterCutoff={afterCutoff} outletName={outletName} />
 
       <div className="review-layout">
         <section className="review-products-panel">
@@ -2751,22 +2777,26 @@ function ReviewOrderPage({ business,
   )
 }
 
-function ConfirmationCard({ business, 
+function ConfirmationCard({ business,
   type,
   afterCutoff,
   items,
+  order,
+  outletName,
 
 }: { business: "fresh" | "style" | "tech", type: OrderType, afterCutoff: boolean
 
   items: Array<CatalogProduct & { quantity: number }>
+  order: CreatedOrder
+  outletName: string
 }) {
   const totalUnits = items.reduce((total, item) => total + item.quantity, 0)
   const details = [
-    { label: "Order number", value: "ORD-1082", data: true },
+    { label: "Order number", value: order.orderNumber, data: true },
     { label: "Status", value: <StatusPill kind="confirmed" /> },
     {
       label: "Submitted",
-      value: "Wednesday, 30 September · 13:46",
+      value: new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(order.createdAt)),
     },
     {
       label: "Order type",
@@ -2774,9 +2804,9 @@ function ConfirmationCard({ business,
     },
     {
       label: "Target planning run",
-      value: afterCutoff ? "Friday, 2 October" : "Thursday, 1 October",
+      value: new Intl.DateTimeFormat(undefined, { dateStyle: "full", timeZone: "UTC" }).format(new Date(`${order.requestedDate}T00:00:00Z`)),
     },
-    { label: "Outlet", value: formatOutlet(business) },
+    { label: "Outlet", value: outletName },
     {
       label: "Products",
       value: `${items.length} products · ${totalUnits} units`,
@@ -2808,12 +2838,16 @@ function OrderConfirmationPage({ business,
   afterCutoff,
   onHome,
   onViewOrder,
+  order,
+  outletName,
 }: { business: "fresh" | "style" | "tech"
   type: OrderType
   quantities: OrderDrafts
   afterCutoff: boolean
   onHome: () => void
   onViewOrder: () => void
+  order: CreatedOrder
+  outletName: string
 }) {
   const items = selectedProducts(business, type, getDraft(quantities, type))
   return (
@@ -2837,7 +2871,7 @@ function OrderConfirmationPage({ business,
       </motion.div>
 
       <div className="confirmation-layout">
-        <ConfirmationCard business={business} type={type} afterCutoff={afterCutoff} items={items} />
+        <ConfirmationCard business={business} type={type} afterCutoff={afterCutoff} items={items} order={order} outletName={outletName} />
         <div className="confirmation-side">
           <div className="next-steps-card">
             <span className="next-steps-icon">
@@ -3331,7 +3365,122 @@ function PrototypeStateControl<T extends string>({
   )
 }
 
-function OrderDetailPage({
+type OrderDetailPageProps = {
+  orderId?: string
+  business: "fresh" | "style" | "tech"
+  state: OrderDetailState
+  outletName: string
+  onBack: () => void
+  onStateChange: (state: OrderDetailState) => void
+  onReviewDelivery: () => void
+  onOpenOrder: (id: string, view: string, state: string) => void
+  onBusinessChange?: (b: "fresh" | "style" | "tech") => void
+  onSimulatePin?: () => void
+  onNavigateDeferred: () => void
+}
+
+function formatStoredDate(value: string, includeTime = false) {
+  const date = new Date(includeTime ? value : `${value}T00:00:00Z`)
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    ...(includeTime ? { timeStyle: "short" as const } : {}),
+    timeZone: "UTC",
+  }).format(date)
+}
+
+function ProductionOrderDetailPage({ orderId, outletName, onBack }: Pick<OrderDetailPageProps, "orderId" | "outletName" | "onBack">) {
+  const [order, setOrder] = useState<StoreOrder | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState("")
+
+  useEffect(() => {
+    let active = true
+    if (!orderId) {
+      setLoading(false)
+      setError("No order was selected.")
+      return () => { active = false }
+    }
+    setLoading(true)
+    void getStoreOrder(orderId)
+      .then((result) => { if (active) { setOrder(result); setError("") } })
+      .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Unable to load the order.") })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [orderId])
+
+  if (loading) return <div className="order-detail-page"><div className="order-detail-utility-row"><button className="order-back-link" type="button" onClick={onBack}><ArrowLeft />Back to orders</button></div><p>Loading order…</p></div>
+  if (error || !order) return <div className="order-detail-page"><div className="order-detail-utility-row"><button className="order-back-link" type="button" onClick={onBack}><ArrowLeft />Back to orders</button></div><div className="submission-error"><AlertTriangle /><div><strong>Order unavailable</strong><p>{error || "The order could not be found."}</p></div></div></div>
+
+  const presentation: Record<StoreOrder["status"], { kind: StatusKind; label: string }> = {
+    submitted: { kind: "confirmed", label: "Order confirmed" },
+    deferred: { kind: "deferred", label: "Deferred" },
+    allocated: { kind: "scheduled", label: "Scheduled" },
+    in_transit: { kind: "transit", label: "On the way" },
+    delivered: { kind: "received", label: "Receipt confirmed" },
+    cancelled: { kind: "cancelled", label: "Cancelled" },
+  }
+  const status = presentation[order.status]
+  const items = order.items.map((item) => ({ id: item.productId, name: item.name, unit: item.unit, quantity: item.quantity }))
+  const effectiveDate = order.status === "deferred" && order.deferredTo ? order.deferredTo : order.requestedDate
+
+  return (
+    <div className="order-detail-page">
+      <div className="order-detail-utility-row">
+        <button className="order-back-link" type="button" onClick={onBack}><ArrowLeft />Back to orders</button>
+      </div>
+      <div className="order-detail-header">
+        <div>
+          <div className="order-detail-title-row"><div className="page-title data-title">{order.orderNumber}</div><StatusPill kind={status.kind} /></div>
+          <p>{formatOrderType(order.brand.toLowerCase() as "fresh" | "style" | "tech", order.orderType)} · {outletName}</p>
+        </div>
+      </div>
+      {order.status === "deferred" && (
+        <div className="delivery-update-card" style={{ marginBottom: 24 }}>
+          <div className="order-detail-section-heading"><div><span><CircleAlert size={16} /> Delivery deferred</span><small>The dispatcher has moved this order to the next delivery date shown below.</small></div></div>
+          <div className="delivery-update-grid">
+            <span><small>Original plan</small><strong>{formatStoredDate(order.requestedDate)}</strong></span>
+            <span className="delivery-update-new"><small>New expected delivery</small><strong>{order.deferredTo ? formatStoredDate(order.deferredTo) : "Not yet rescheduled"}</strong></span>
+            <span><small>Reason</small><strong>{order.deferralReason || "No reason supplied"}</strong></span>
+          </div>
+        </div>
+      )}
+      <div className="order-detail-layout">
+        <div className="order-detail-primary">
+          <section className="review-card">
+            <div className="order-detail-section-heading"><div><span>Order items</span><small>Data saved with this order.</small></div></div>
+            <ReviewProductList items={items} />
+          </section>
+        </div>
+        <aside className="order-detail-sidebar">
+          <section className="review-card">
+            <div className="order-detail-section-heading"><div><span>Delivery details</span></div></div>
+            <div className="order-summary-grid">
+              <div><span>Status</span><strong>{status.label}</strong></div>
+              <div><span>Delivery date</span><strong>{formatStoredDate(effectiveDate)}</strong></div>
+              <div><span>Submitted</span><strong>{formatStoredDate(order.createdAt, true)}</strong></div>
+              <div><span>Total weight</span><strong>{order.totalWeightKg.toLocaleString()} kg</strong></div>
+            </div>
+          </section>
+          <section className="review-card">
+            <div className="order-detail-section-heading"><div><span>Order history</span></div></div>
+            <ol className="order-detail-timeline">
+              {order.statusHistory.map((entry, index) => <li key={`${entry.status}-${entry.at}-${index}`}><CheckCircle2 /><span><strong>{entry.status.replaceAll("_", " ")}</strong><small>{formatStoredDate(entry.at, true)}{entry.note ? ` · ${entry.note}` : ""}</small></span></li>)}
+            </ol>
+          </section>
+        </aside>
+      </div>
+    </div>
+  )
+}
+
+function OrderDetailPage(props: OrderDetailPageProps) {
+  if (import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE !== "true") {
+    return <ProductionOrderDetailPage orderId={props.orderId} outletName={props.outletName} onBack={props.onBack} />
+  }
+  return <PrototypeOrderDetailPage {...props} />
+}
+
+function PrototypeOrderDetailPage({
   orderId = "ORD-1082",
   business,
   state,
@@ -3341,18 +3490,7 @@ function OrderDetailPage({
   onBusinessChange,
   onSimulatePin,
   onNavigateDeferred,
-}: {
-  orderId?: string
-  business: "fresh" | "style" | "tech"
-  state: OrderDetailState
-  onBack: () => void
-  onStateChange: (state: OrderDetailState) => void
-  onReviewDelivery: () => void
-    onOpenOrder: (id: string, view: string, state: string) => void
-    onBusinessChange?: (b: "fresh" | "style" | "tech") => void
-  onSimulatePin?: () => void
-  onNavigateDeferred: () => void
-}) {
+}: OrderDetailPageProps) {
   
   const [warehouseIssue, setWarehouseIssue] = useState(false)
   const [wasDeferred, setWasDeferred] = useState(state === "deferred")
@@ -4305,13 +4443,28 @@ function OrdersPage({ business, onNewOrder, onOpenOrder }: { business: "fresh" |
 
   const [search, setSearch] = useState("")
   const [statusFilter, setStatusFilter] = useState("All")
+  const [liveOrders, setLiveOrders] = useState<StoreOrder[]>([])
+  const [loading, setLoading] = useState(import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE !== "true")
+  const [loadError, setLoadError] = useState("")
+  const prototypeMode = import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE === "true"
+
+  useEffect(() => {
+    if (prototypeMode) return
+    let active = true
+    setLoading(true)
+    void listStoreOrders()
+      .then((rows) => { if (active) { setLiveOrders(rows); setLoadError("") } })
+      .catch((error) => { if (active) setLoadError(error instanceof Error ? error.message : "Unable to load orders.") })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [prototypeMode])
   
   const statuses = [
     "All", "Order confirmed", "Scheduled", "On the way", 
     "Deferred", "Awaiting confirmation", "Receipt confirmed"
   ]
 
-  const orders = [
+  const prototypeOrders = [
     { id: "ORD-1082", type: formatOrderType(business || "fresh", getDefaultOrderType(business || "fresh")), date: "Thursday, 1 October", statusLabel: "Order confirmed", status: "confirmed" as StatusKind, view: "order-detail", state: "confirmed" },
     { id: "ORD-1065", type: formatOrderType(business || "fresh", business === "fresh" ? "chilled" : getDefaultOrderType(business || "fresh")), date: "Friday, 2 October", statusLabel: "Deferred", status: "deferred" as StatusKind, subtext: business === "fresh" ? "Refrigerated capacity" : "Vehicle capacity constraints", view: "order-detail", state: "deferred" },
     { id: "ORD-1062", type: formatOrderType(business || "fresh", getDefaultOrderType(business || "fresh")), date: "Thursday, 1 October", statusLabel: "Scheduled", status: "scheduled" as StatusKind, eta: "Expected arrival 06:40–07:00", view: "order-detail", state: "scheduled" },
@@ -4319,6 +4472,31 @@ function OrdersPage({ business, onNewOrder, onOpenOrder }: { business: "fresh" |
     { id: "ORD-1045", type: formatOrderType(business || "fresh", getDefaultOrderType(business || "fresh")), date: "Today", statusLabel: "Awaiting confirmation", status: "awaiting" as StatusKind, subtext: "Driver completed delivery at 06:52", view: "verify-delivery", state: "verify" },
     { id: "ORD-1037", type: formatOrderType(business || "fresh", getDefaultOrderType(business || "fresh")), date: "Today · 06:57", statusLabel: "Receipt confirmed", status: "received" as StatusKind, view: "order-detail", state: "receipt-confirmed" }
   ]
+
+  const statusPresentation: Record<StoreOrder["status"], { label: string; kind: StatusKind; state: OrderDetailState }> = {
+    submitted: { label: "Order confirmed", kind: "confirmed", state: "confirmed" },
+    deferred: { label: "Deferred", kind: "deferred", state: "deferred" },
+    allocated: { label: "Scheduled", kind: "scheduled", state: "scheduled" },
+    in_transit: { label: "On the way", kind: "transit", state: "on-way" },
+    delivered: { label: "Receipt confirmed", kind: "received", state: "receipt-confirmed" },
+    cancelled: { label: "Cancelled", kind: "cancelled", state: "confirmed" },
+  }
+  const orders = prototypeMode ? prototypeOrders.map((order) => ({ ...order, recordId: order.id })) : liveOrders.map((order) => {
+    const presentation = statusPresentation[order.status]
+    const effectiveDate = order.status === "deferred" && order.deferredTo ? order.deferredTo : order.requestedDate
+    const orderBusiness = order.brand.toLowerCase() as "fresh" | "style" | "tech"
+    return {
+      id: order.orderNumber,
+      recordId: order._id,
+      type: formatOrderType(orderBusiness, order.orderType),
+      date: new Intl.DateTimeFormat(undefined, { dateStyle: "full", timeZone: "UTC" }).format(new Date(`${effectiveDate}T00:00:00Z`)),
+      statusLabel: presentation.label,
+      status: presentation.kind,
+      view: "order-detail",
+      state: presentation.state,
+      subtext: order.status === "deferred" ? order.deferralReason : undefined,
+    }
+  })
 
   const filtered = orders.filter(o => 
     o.id.toLowerCase().includes(search.toLowerCase()) && 
@@ -4371,13 +4549,23 @@ function OrdersPage({ business, onNewOrder, onOpenOrder }: { business: "fresh" |
       </div>
 
       <div className="upcoming-list" style={{ marginTop: "var(--space-6)" }}>
-        {filtered.length > 0 ? filtered.map(order => (
+        {loading ? (
+          <div style={{ textAlign: "center", padding: "var(--space-8) 0", color: "var(--text-secondary)" }}>
+            <LoaderCircle className="loading-icon" style={{ margin: "0 auto var(--space-2)", display: "block" }} />
+            <p style={{ margin: 0 }}>Loading orders…</p>
+          </div>
+        ) : loadError ? (
+          <div style={{ textAlign: "center", padding: "var(--space-8) 0", color: "var(--text-secondary)" }}>
+            <AlertTriangle style={{ margin: "0 auto var(--space-2)", display: "block" }} />
+            <p style={{ margin: 0 }}>{loadError}</p>
+          </div>
+        ) : filtered.length > 0 ? filtered.map(order => (
           <motion.button
             key={order.id}
             className="upcoming-row"
             type="button"
             layout
-            onClick={() => onOpenOrder(order.id, order.view, order.state)}
+            onClick={() => onOpenOrder(order.recordId, order.view, order.state)}
             whileTap={{ scale: 0.99 }}
             transition={calmSpring}
           >
@@ -4542,11 +4730,11 @@ function DeliveriesPage({ business, onOpenOrder }: { business: "fresh" | "style"
   )
 }
 
-export default function App() {
+function StoreManagerApplication({ initialBusiness, outletName }: { initialBusiness: "fresh" | "style" | "tech"; outletName: string }) {
   const params = new URLSearchParams(window.location.search)
   const prototypeState = params.get("state")
   const prototypeView = params.get("view")
-  const initialBusiness = (params.get("business") as "fresh" | "style" | "tech") || "fresh"
+  const prototypeMode = import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE === "true"
   const [business, setBusiness] = useState<"fresh" | "style" | "tech">(initialBusiness)
   const showAttention = prototypeState !== "no-attention"
   const afterCutoff = prototypeState === "after-cutoff"
@@ -4556,16 +4744,20 @@ export default function App() {
   const [orderType, setOrderType] = useState<OrderType>(initialOrderType)
 
   function handleBusinessChange(newBusiness: "fresh" | "style" | "tech") {
+    if (!prototypeMode && newBusiness !== initialBusiness) return
     setBusiness(newBusiness)
     setOrderType(getDefaultOrderType(newBusiness))
   }
-  const [drafts, setDrafts] = useState<OrderDrafts>(prototypeState === "empty" ? { dry: {}, chilled: {}, products: {} } as unknown as OrderDrafts : mockDrafts[business])
+  const emptyDrafts = (): OrderDrafts => ({ dry: {}, chilled: {}, products: {} })
+  const [drafts, setDrafts] = useState<OrderDrafts>(prototypeMode && prototypeState !== "empty" ? mockDrafts[business] : emptyDrafts())
 
   useEffect(() => {
-    if (prototypeState !== "empty") {
+    if (prototypeMode && prototypeState !== "empty") {
       setDrafts(mockDrafts[business])
+    } else if (!prototypeMode) {
+      setDrafts(emptyDrafts())
     }
-  }, [business])
+  }, [business, prototypeMode, prototypeState])
   const [view, setView] =
     useState<"home" | "orders" | "deliveries" | "new-order" | "review" | "confirmation" | "order-detail" | "deferred-detail" | "verify-delivery">(
       prototypeView === "new-order" ||
@@ -4612,7 +4804,8 @@ export default function App() {
               : "verify"
   const [receiptFlowState, setReceiptFlowState] =
     useState<ReceiptFlowState>(initialReceiptState)
-  const [selectedOrderId, setSelectedOrderId] = useState<string>("ORD-1082")
+  const [selectedOrderId, setSelectedOrderId] = useState<string>(prototypeMode ? "ORD-1082" : "")
+  const [createdOrder, setCreatedOrder] = useState<CreatedOrder | null>(null)
 
   
     function handleOpenOrder(id: string, nextView: string, state: string) {
@@ -4661,7 +4854,7 @@ export default function App() {
           <AnimatePresence mode="wait" initial={false} custom={directionRef.current}>
           {view === "home" && (
             <motion.div key="home" custom={directionRef.current} variants={pageVariants} initial="enter" animate="center" exit="exit" transition={{ duration: 0.22, ease: "easeOut" }}>
-              <HomePage
+              {prototypeMode ? <HomePage
                 business={business}
                 onBusinessChange={handleBusinessChange}
                 showAttention={showAttention}
@@ -4674,7 +4867,11 @@ export default function App() {
                 }}
                 onOpenOrder={handleOpenOrder}
                 onNavigate={navigate}
-              />
+              /> : <OrdersPage
+                business={business}
+                onNewOrder={() => setView("new-order")}
+                onOpenOrder={handleOpenOrder}
+              />}
             </motion.div>
           )}
           {view === "orders" && (
@@ -4729,12 +4926,17 @@ export default function App() {
                 afterCutoff={afterCutoff}
                 forceError={prototypeState === "submit-error"}
                 onBack={() => setView("new-order")}
-                onConfirmed={() => setView("confirmation")}
+                outletName={outletName}
+                onConfirmed={(order) => {
+                  setCreatedOrder(order)
+                  setSelectedOrderId(order._id)
+                  setView("confirmation")
+                }}
               />
             </motion.div>
           )}
 
-          {view === "confirmation" && (
+          {view === "confirmation" && createdOrder && (
             <motion.div
               key="confirmation"
               initial={{ opacity: 0, y: 10 }}
@@ -4746,8 +4948,11 @@ export default function App() {
                 type={orderType}
                 quantities={drafts}
                 afterCutoff={afterCutoff}
-                onHome={() => setView("home")}
+                order={createdOrder}
+                outletName={outletName}
+                onHome={() => { setDrafts(emptyDrafts()); setView("home") }}
                 onViewOrder={() => {
+                  setDrafts(emptyDrafts())
                   setOrderDetailState("confirmed")
                   setView("order-detail")
                 }}
@@ -4766,6 +4971,7 @@ export default function App() {
               <OrderDetailPage
                 orderId={selectedOrderId}
                 business={business}
+                outletName={outletName}
                 onBusinessChange={handleBusinessChange}
                 state={orderDetailState}
                 onBack={() => setView("home")}
@@ -4820,6 +5026,28 @@ export default function App() {
       <BottomNavigation current={currentNav} onNavigate={navigate} />
     </div>
   )
+}
+
+export default function App() {
+  const prototypeMode = import.meta.env.VITE_ALLOW_UNAUTHENTICATED_PROTOTYPE === "true"
+  const prototypeBusiness = (new URLSearchParams(window.location.search).get("business") as "fresh" | "style" | "tech") || "fresh"
+  const [context, setContext] = useState<StoreContext | null>(null)
+  const [error, setError] = useState("")
+
+  useEffect(() => {
+    if (prototypeMode) return
+    let active = true
+    void getStoreContext()
+      .then((result) => { if (active) setContext(result) })
+      .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Unable to load the assigned outlet.") })
+    return () => { active = false }
+  }, [prototypeMode])
+
+  if (prototypeMode) return <StoreManagerApplication initialBusiness={prototypeBusiness} outletName={formatOutlet(prototypeBusiness)} />
+  if (error) return <main style={{ fontFamily: "system-ui", padding: 32 }}><h1>Store unavailable</h1><p>{error}</p></main>
+  if (!context) return <main style={{ fontFamily: "system-ui", padding: 32 }}>Loading assigned store…</main>
+  const business = context.outlet.brand.toLowerCase() as "fresh" | "style" | "tech"
+  return <StoreManagerApplication initialBusiness={business} outletName={context.outlet.displayName} />
 }
 
 
